@@ -1,0 +1,148 @@
+!pip install catboost shap --quiet
+
+from google.colab import drive
+drive.mount("/content/drive")
+
+import os
+import math
+import numpy as np
+import pandas as pd
+import shap
+import matplotlib.pyplot as plt
+from scipy.stats import binned_statistic
+from catboost import CatBoostClassifier
+
+# ---------------- PATH ----------------
+BASE = "/content/drive/MyDrive/Rudraprayag"
+TRAIN_CSV = f"{BASE}/dataset_final/Training_LS_FINAL_UTM.csv"
+OUT_DIR = f"{BASE}/model_output_SHAP_DTL_STYLE"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ---------------- PARAMETERS ----------------
+PARAMS = [
+    "Aspect","Curvature","DTL","DTR","DTS","DTT","Elevation",
+    "Slope Length","NDVI","NDWI","Plan Curv","Prof Curv","Roughness","RSP","Slope",
+    "Soil Depletion","Soil Moisture","Solar Radiation",
+    "SPI","TPI","TWI","VD","VDCN"
+]
+TARGET = "grid_code"
+
+# ---------------- LOAD DATA ----------------
+df = pd.read_csv(TRAIN_CSV)
+X = df[PARAMS].apply(pd.to_numeric, errors="coerce")
+X = X.fillna(X.median()).values.astype("float32")
+y = df[TARGET].astype(int).values
+
+# ---------------- TRAIN CATBOOST ----------------
+model = CatBoostClassifier(
+    iterations=500,
+    depth=6,
+    learning_rate=0.05,
+    loss_function="Logloss",
+    random_seed=42,
+    verbose=False
+)
+model.fit(X, y)
+
+# ---------------- SHAP ----------------
+explainer = shap.TreeExplainer(model)
+shap_values = explainer.shap_values(X)
+proba = model.predict_proba(X)[:,1]
+
+# ---------------- LAYOUT ----------------
+n_cols = 4
+n_rows = math.ceil(len(PARAMS) / n_cols)
+
+fig, axes = plt.subplots(
+    n_rows, n_cols,
+    figsize=(22, n_rows * 4)
+)
+
+axes = axes.flatten()
+
+# ---------------- PLOTTING ----------------
+for i, feature_name in enumerate(PARAMS):
+
+    ax = axes[i]
+    x = X[:, i]
+    y_shap = shap_values[:, i]
+
+    # Scatter (circle with border)
+    sc = ax.scatter(
+        x,
+        y_shap,
+        c=y_shap,
+        cmap="RdBu_r",
+        s=35,
+        alpha=0.7,
+        edgecolors="black",
+        linewidths=0.4
+    )
+
+    # Median SHAP (binned)
+    bin_med, bin_edges, _ = binned_statistic(
+        x, y_shap, statistic="median", bins=25
+    )
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    ax.plot(bin_centers, bin_med, color="black", linewidth=1.5)
+
+    # Zero cross
+    zero_idx = np.nanargmin(np.abs(bin_med))
+    zero_x = bin_centers[zero_idx]
+
+    ax.axvline(
+        zero_x,
+        color="green",
+        linestyle="--",
+        linewidth=1.5
+    )
+
+    ax.axhline(0, color="gray", linestyle=":", linewidth=1)
+
+    # Titles (exact format)
+    ax.set_title(
+        f"SHAP Dependence Plot: {feature_name}\n"
+        f"Predicted positive = Proba ≥ 0.50",
+        fontsize=11
+    )
+
+    ax.set_xlabel(f"{feature_name} (standardized)", fontsize=10)
+    ax.set_ylabel("SHAP Value", fontsize=10)
+
+    # Legend (only first few to avoid clutter)
+    if i == 0:
+        ax.legend(
+            [
+                "Median SHAP (binned)",
+                f"Zero-cross ≈ {zero_x:.2f}"
+            ],
+            fontsize=9
+        )
+
+    ax.tick_params(labelsize=9)
+
+# Remove empty axes
+for j in range(len(PARAMS), len(axes)):
+    fig.delaxes(axes[j])
+
+# ---------------- COLORBAR ----------------
+fig.subplots_adjust(right=0.92, hspace=0.6, wspace=0.35)
+
+cbar_ax = fig.add_axes([0.94, 0.25, 0.015, 0.5])
+cbar = fig.colorbar(sc, cax=cbar_ax)
+cbar.set_label("SHAP Value", fontsize=12)
+
+# ---------------- SAVE ----------------
+output_path = f"{OUT_DIR}/CatBoost_SHAP_DTL_STYLE_GRID.png"
+
+plt.savefig(
+    output_path,
+    dpi=1200,
+    bbox_inches="tight",
+    facecolor="white"
+)
+
+plt.show()
+
+print("✅ DTL-style SHAP grid generated.")
+print("📁", output_path)
