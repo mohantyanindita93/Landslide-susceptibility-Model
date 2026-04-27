@@ -1,0 +1,212 @@
+# ==========================================================
+# 0. INSTALL & IMPORTS
+# ==========================================================
+!pip install torch scikit-learn rasterio tqdm joblib --quiet
+
+import os, re
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score
+import rasterio
+from rasterio.windows import Window
+import joblib
+from tqdm import tqdm
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+# ==========================================================
+# 1. PATHS
+# ==========================================================
+BASE = "/content/drive/MyDrive/Rudraprayag"
+
+TRAIN_CSV  = f"{BASE}/dataset_final/Training_LS_FINAL_UTM.csv"
+RASTER_DIR = f"{BASE}/Re"
+
+OUT_DIR = f"{BASE}/model_output_UF_FRDL"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+MODEL_PATH  = f"{OUT_DIR}/UF_FRDL_model.pt"
+SCALER_PATH = f"{OUT_DIR}/UF_FRDL_scaler.joblib"
+OUT_TIF     = f"{OUT_DIR}/UF_FRDL_LSM.tif"
+
+# ==========================================================
+# 2. PARAMETERS
+# ==========================================================
+PARAMS = [
+    "Aspect","Curvature","DTL","DTR","DTS","DTT","Elevation","Geomorphology","Lithology",
+    "Slope Length","LULC","NDVI","NDWI","Plan Curv","Prof Curv","Roughness","RSP","Slope",
+    "Soil Texture","Soil Depletion","Soil Moisture","Solar Radiation","SPI","TPI","TWI",
+    "VD","VDCN"
+]
+TARGET = "grid_code"
+
+# ==========================================================
+# 3. LOAD TRAINING DATA
+# ==========================================================
+df = pd.read_csv(TRAIN_CSV)
+
+df[PARAMS] = df[PARAMS].apply(pd.to_numeric, errors="coerce")
+df[PARAMS] = df[PARAMS].fillna(df[PARAMS].median())
+
+X = df[PARAMS].values.astype("float32")
+y = df[TARGET].astype(int).values
+
+print("Training samples:", X.shape[0])
+
+# ==========================================================
+# 4. COMPUTE FREQUENCY RATIO (FIXED – INTEGER KEYS)
+# ==========================================================
+FR = {}
+
+for i, p in enumerate(PARAMS):
+    bins = np.unique(np.percentile(X[:, i], np.linspace(0, 100, 6)))
+    fr_vals = {}
+
+    for j in range(len(bins) - 1):
+        m = (X[:, i] >= bins[j]) & (X[:, i] < bins[j + 1])
+        if m.sum() > 0:
+            fr_vals[j] = (y[m].mean() + 1e-6) / (y.mean() + 1e-6)
+        else:
+            fr_vals[j] = 1.0
+
+    FR[p] = {"bins": bins, "fr": fr_vals}
+
+print("✅ Frequency Ratio weights computed")
+
+# ==========================================================
+# 5. APPLY FR TRANSFORMATION (NO KeyError)
+# ==========================================================
+def apply_fr(X, FR):
+    Xf = np.zeros_like(X)
+    for i, p in enumerate(PARAMS):
+        bins = FR[p]["bins"]
+        fr   = FR[p]["fr"]
+        for j in range(len(bins) - 1):
+            idx = (X[:, i] >= bins[j]) & (X[:, i] < bins[j + 1])
+            Xf[idx, i] = X[idx, i] * fr[j]
+    return Xf
+
+X_fr = apply_fr(X, FR)
+
+# ==========================================================
+# 6. SCALE
+# ==========================================================
+scaler = StandardScaler()
+X_fr = scaler.fit_transform(X_fr)
+
+joblib.dump(scaler, SCALER_PATH)
+print("✅ Scaler saved")
+
+# ==========================================================
+# 7. DEEP LEARNING MODEL
+# ==========================================================
+class FRDL(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        return self.net(x).squeeze()
+
+model = FRDL(X_fr.shape[1]).to(device)
+opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+loss_fn = nn.BCELoss()
+
+Xt = torch.tensor(X_fr, dtype=torch.float32).to(device)
+yt = torch.tensor(y, dtype=torch.float32).to(device)
+
+# ==========================================================
+# 8. TRAIN
+# ==========================================================
+for ep in range(40):
+    opt.zero_grad()
+    pred = model(Xt)
+    loss = loss_fn(pred, yt)
+    loss.backward()
+    opt.step()
+    if (ep + 1) % 10 == 0:
+        print(f"Epoch {ep+1:02d} | Loss: {loss.item():.4f}")
+
+torch.save(model.state_dict(), MODEL_PATH)
+print("✅ UF-FRDL model saved")
+
+# ==========================================================
+# 9. CREATE OUTPUT MAP FROM PARAMETER TIFF FILES
+# ==========================================================
+def norm(s): return re.sub(r"[^a-z0-9]+","", s.lower())
+
+tifs = [f for f in os.listdir(RASTER_DIR) if f.endswith(".tif")]
+RASTER_MAP = {p: [t for t in tifs if norm(p) in norm(t)][0] for p in PARAMS}
+
+# Reference raster
+with rasterio.open(os.path.join(RASTER_DIR, RASTER_MAP[PARAMS[0]])) as ref:
+    profile = ref.profile.copy()
+    H, W = ref.height, ref.width
+
+profile.update(dtype="float32", nodata=-9999, count=1)
+
+model.eval()
+
+with rasterio.open(OUT_TIF, "w", **profile) as dst:
+    for r in tqdm(range(H), desc="UF-FRDL mapping"):
+        rows = []
+        for p in PARAMS:
+            with rasterio.open(os.path.join(RASTER_DIR, RASTER_MAP[p])) as src:
+                rows.append(src.read(1, window=Window(0, r, W, 1)).reshape(-1))
+
+        Xr = np.stack(rows, axis=1)
+        Xr = np.nan_to_num(Xr, nan=np.nanmedian(Xr))
+
+        Xr = apply_fr(Xr, FR)
+        Xr = scaler.transform(Xr)
+
+        with torch.no_grad():
+            s = model(torch.tensor(Xr, dtype=torch.float32).to(device)).cpu().numpy()
+
+        dst.write(s.reshape(1, W).astype("float32"), 1, window=Window(0, r, W, 1))
+
+print("✅ Final UF-FRDL susceptibility map created:")
+print(OUT_TIF)
+import rasterio
+import numpy as np
+import matplotlib.pyplot as plt
+
+# --------------------------------------------------
+# PATH TO UF-FRDL OUTPUT MAP
+# --------------------------------------------------
+UF_FRDL_TIF = "/content/drive/MyDrive/Rudraprayag/model_output_UF_FRDL/UF_FRDL_LSM.tif"
+
+# --------------------------------------------------
+# READ RASTER
+# --------------------------------------------------
+with rasterio.open(UF_FRDL_TIF) as src:
+    arr = src.read(1)
+    nodata = src.nodata
+
+# Handle NoData values
+arr = np.where(arr == nodata, np.nan, arr)
+
+print("Susceptibility range:",
+      np.nanmin(arr), "to", np.nanmax(arr))
+
+# --------------------------------------------------
+# PLOT MAP
+# --------------------------------------------------
+plt.figure(figsize=(10, 7))
+im = plt.imshow(arr, cmap="plasma", vmin=0, vmax=1)
+plt.colorbar(im, label="UF-FRDL Landslide Susceptibility (0–1)", shrink=0.85)
+
+plt.title("UF-FRDL Landslide Susceptibility Map")
+plt.axis("off")
+plt.tight_layout()
+plt.show()
